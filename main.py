@@ -1,31 +1,81 @@
-# 📋 main.py · [실습 6-1] 백엔드 — 사진 · 음성 도우미 API (Vercel 에 올릴 main.py · POST 한 번에 요청 1번)
-# · 키는 서버 환경 변수 GEMINI_API_KEY · 접근 코드는 APP_ACCESS_CODE (13주차와 같음)
-# · 사진 · 음성은 화면(Streamlit)이 base64 글자로 바꿔 JSON 으로 보냄 — Vercel 요청 본문 4.5MB 이하
+# main.py · 나만의 요리 레시피 도우미 백엔드
+
 import base64
 import binascii
+import json
 import os
-from typing import Literal
 
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
 
+
 MODEL_NAME = "gemini-3.5-flash-lite"
-MAX_B64 = 4_000_000                 # base64 글자 수 상한 — Vercel 요청 본문 4.5MB 보다 조금 작게
-VOICE_PROMPTS = {
-    "받아쓰기": "이 음성을 한국어로 그대로 받아써 줘. 잘 안 들리는 부분은 (?) 로 표시해 줘.",
-    "한 줄 요약": "이 음성의 내용을 한 문장으로 요약해 줘.",
-    "영어로 번역": "이 음성의 내용을 자연스러운 영어로 번역해 줘.",
+
+# 서비스 이름과 소개
+APP_TITLE = "나만의 요리 레시피 도우미"
+APP_ICON = "🍳"
+APP_DESCRIPTION = (
+    "만들고 싶은 요리 이름과 사진을 입력하면 "
+    "재료와 조리 방법을 알려드립니다."
+)
+
+# AI에게 시킬 일
+PROMPT = """
+당신은 요리 레시피 안내 도우미입니다.
+
+사용자가 입력한 요리 이름을 기준으로
+요리에 필요한 재료와 조리 순서를 한국어로 알려 주세요.
+
+사진은 음식이나 재료를 확인하는 데 참고하세요.
+사진에서 확인되지 않은 것은 추측하지 마세요.
+
+음식 이름이 불명확하면 임의로 다른 음식을 고르지 말고
+음식 이름을 구체적으로 입력해 달라고 안내하세요.
+
+사진만으로 식품의 신선도나 안전성을 확정하지 마세요.
+재료의 익힘 등 필요한 조리상 주의사항을 알려 주세요.
+"""
+
+# 결과로 보여줄 항목
+FIELDS = {
+    "음식": "사용자가 만들고 싶은 요리 이름",
+    "사진에서 확인한 내용": (
+        "사진에서 확실하게 확인할 수 있는 음식 또는 재료. "
+        "불확실하면 확인하기 어렵다고 표시"
+    ),
+    "재료": (
+        "요리에 필요한 재료. 사진으로 확인한 재료와 "
+        "추가로 필요한 재료를 구분"
+    ),
+    "레시피": "따라 하기 쉽게 번호를 붙여 설명한 조리 순서",
+    "주의사항": "조리와 재료 취급 시 주의할 점",
 }
-app = FastAPI(title="사진 · 음성 도우미 API", description="사진이나 음성을 base64 로 보내면 Gemini 가 읽고 답합니다.")
+
+SCHEMA = {
+    "type": "object",
+    "properties": {
+        name: {
+            "type": "string",
+            "description": description,
+        }
+        for name, description in FIELDS.items()
+    },
+    "required": list(FIELDS),
+}
+
+app = FastAPI(
+    title=APP_TITLE,
+    description=APP_DESCRIPTION,
+)
 
 
 class PhotoRequest(BaseModel):
     image_b64: str = Field(
         min_length=1,
         max_length=4_000_000,
-        description="사진(JPEG)을 base64로 바꾼 글자",
+        description="JPEG 사진을 base64로 인코딩한 문자열",
     )
     food_name: str = Field(
         min_length=1,
@@ -34,70 +84,154 @@ class PhotoRequest(BaseModel):
     )
 
 
-class VoiceRequest(BaseModel):
-    audio_b64: str = Field(min_length=1, description="녹음(WAV)을 base64 로 바꾼 글자")
-    task: Literal["받아쓰기", "한 줄 요약", "영어로 번역"] = "받아쓰기"
-
-
-class Answer(BaseModel):
-    answer: str
+class Result(BaseModel):
+    result: dict[str, str]
     tokens: int | None = None
 
 
 def check_access(access_code):
-    """APP_ACCESS_CODE 가 정해져 있으면, 요청 헤더 X-Access-Code 가 같아야만 통과"""
+    """접근 코드가 설정되어 있고 요청 값과 같은지 확인합니다."""
     expected = os.environ.get("APP_ACCESS_CODE")
-    if expected and access_code != expected:
-        raise HTTPException(status_code=401, detail="접근 코드가 틀렸습니다 — 헤더 X-Access-Code 를 확인하세요")
 
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="서버에 APP_ACCESS_CODE가 설정되지 않았습니다",
+        )
 
-def check_b64(text):
-    """base64 글자가 맞는지 · 너무 크지 않은지 먼저 검사 — 틀리면 Gemini 까지 가지 않음"""
-    if len(text) > MAX_B64:
-        raise HTTPException(status_code=413, detail="파일이 너무 큽니다 — 사진은 줄이고, 녹음은 짧게 보내세요")
-    try:
-        base64.b64decode(text, validate=True)
-    except (binascii.Error, ValueError):
-        raise HTTPException(status_code=422, detail="base64 글자가 아닙니다 — 화면에서 b64encode 했는지 확인하세요")
+    if access_code != expected:
+        raise HTTPException(
+            status_code=401,
+            detail="접근 코드가 틀렸습니다",
+        )
 
 
 def get_client():
+    """환경 변수에서 Gemini API 키를 읽습니다."""
     api_key = os.environ.get("GEMINI_API_KEY")
+
     if not api_key:
-        raise HTTPException(status_code=503, detail="서버에 GEMINI_API_KEY 가 없습니다 — 환경 변수를 확인하세요")
+        raise HTTPException(
+            status_code=503,
+            detail="서버에 GEMINI_API_KEY가 설정되지 않았습니다",
+        )
+
     return genai.Client(
         api_key=api_key,
-        http_options=types.HttpOptions(timeout=120_000, retry_options=types.HttpRetryOptions(http_status_codes=[500, 503])),
+        http_options=types.HttpOptions(
+            timeout=120_000,
+            retry_options=types.HttpRetryOptions(
+                http_status_codes=[500, 503]
+            ),
+        ),
     )
-
-
-def ask(text, part):
-    """글 부분 + 사진(음성) 부분을 Gemini 에 보내고 Answer 로 돌려줌"""
-    client = get_client()                           # 변수에 담아 둠 (9주차 — 담지 않으면 요청 전에 닫힘)
-    try:
-        reply = client.interactions.create(model=MODEL_NAME, store=False, input=[{"type": "text", "text": text}, part])
-    except Exception as error:
-        code = getattr(error, "status_code", None)
-        if code == 429:
-            raise HTTPException(status_code=429, detail="Gemini 무료 한도를 넘었습니다 — 1분 뒤 다시 요청하세요")
-        raise HTTPException(status_code=502, detail=f"Gemini 요청 실패 (상태 번호 {code})")
-    return Answer(answer=reply.output_text, tokens=reply.usage.total_tokens)
 
 
 @app.get("/")
 def home():
-    return {"message": "사진 · 음성 도우미 API 입니다. /docs 에서 사용법을 보세요.", "tasks": list(VOICE_PROMPTS)}
+    """서비스 소개와 결과 항목을 반환합니다."""
+    return {
+        "name": APP_TITLE,
+        "icon": APP_ICON,
+        "description": APP_DESCRIPTION,
+        "fields": list(FIELDS),
+    }
 
 
-@app.post("/describe", response_model=Answer)
-def describe(request: PhotoRequest, x_access_code: str | None = Header(default=None)):
-    check_access(x_access_code)                     # ① 접근 코드
-    check_b64(request.image_b64)                    # ② 크기 · base64 검사
-    return ask(request.question, {"type": "image", "data": request.image_b64, "mime_type": request.mime_type})
-
-
-@app.post("/listen", response_model=Answer)
-def listen(request: VoiceRequest, x_access_code: str | None = Header(default=None)):
+@app.post("/analyze", response_model=Result)
+def analyze(
+    request: PhotoRequest,
+    x_access_code: str | None = Header(default=None),
+):
+    # 접근 코드 확인
     check_access(x_access_code)
-    check_b64(request.audio_b64)
-    return ask(VOICE_PROMPTS[request.task], {"type": "audio", "data": request.audio_b64, "mime_type": "audio/wav"})
+
+    # 음식 이름 확인
+    food_name = request.food_name.strip()
+
+    if not food_name:
+        raise HTTPException(
+            status_code=422,
+            detail="음식 이름을 입력해 주세요",
+        )
+
+    # 사진의 base64 형식 확인
+    try:
+        photo = base64.b64decode(
+            request.image_b64,
+            validate=True,
+        )
+    except (binascii.Error, ValueError):
+        raise HTTPException(
+            status_code=422,
+            detail="사진의 base64 형식이 올바르지 않습니다",
+        )
+
+    # JPEG 파일인지 확인
+    if not photo.startswith(b"\xff\xd8\xff"):
+        raise HTTPException(
+            status_code=422,
+            detail="JPEG 형식의 사진을 보내 주세요",
+        )
+
+    client = get_client()
+
+    # 음식 이름과 사진을 Gemini에 전달
+    try:
+        reply = client.interactions.create(
+            model=MODEL_NAME,
+            store=False,
+            input=[
+                {
+                    "type": "text",
+                    "text": (
+                        f"{PROMPT}\n\n"
+                        f"사용자가 입력한 음식 이름: {food_name}"
+                    ),
+                },
+                {
+                    "type": "image",
+                    "data": request.image_b64,
+                    "mime_type": "image/jpeg",
+                },
+            ],
+            response_format={
+                "type": "text",
+                "mime_type": "application/json",
+                "schema": SCHEMA,
+            },
+        )
+    except Exception as error:
+        code = getattr(error, "status_code", None)
+
+        raise HTTPException(
+            status_code=429 if code == 429 else 502,
+            detail="Gemini 요청에 실패했습니다. 잠시 뒤 다시 시도하세요.",
+        ) from error
+
+    # Gemini 응답을 JSON으로 변환
+    try:
+        result = json.loads(reply.output_text)
+
+        if not isinstance(result, dict):
+            raise ValueError("결과가 딕셔너리가 아닙니다")
+
+        if any(
+            not isinstance(result.get(name), str)
+            for name in FIELDS
+        ):
+            raise ValueError("결과 항목이 올바르지 않습니다")
+
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=502,
+            detail="AI 응답을 읽을 수 없습니다. 다시 시도해 주세요",
+        )
+
+    usage = getattr(reply, "usage", None)
+    tokens = getattr(usage, "total_tokens", None)
+
+    return Result(
+        result={name: result[name] for name in FIELDS},
+        tokens=tokens,
+    )
